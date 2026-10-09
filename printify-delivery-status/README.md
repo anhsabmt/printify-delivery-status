@@ -1,6 +1,8 @@
-# Printify Delivery Status 1.0.5
+# Printify Delivery Status 1.0.6
 
-1.0.5 makes Save and Sync now run immediately, automatically groups multiple source shipments matching one WooCommerce order, and shows only status badges. Clicking a badge opens that shipment's TrackOrder URL in a new tab. The refund-record fix from 1.0.4 is retained: only actual shop orders are indexed and linked; refunded parent orders remain eligible.
+1.0.6 fixes a PHP 8 fatal error during WordPress initialization: `init` supplies an empty string, which 1.0.5 incorrectly treated as the numeric scheduling delay. The callback now accepts zero hook arguments and uses its default delay. Regression checks cover both Action Scheduler and WP-Cron.
+
+Immediate Save/Sync, automatic grouping of multiple source shipments matching one WooCommerce order, and clickable status-only badges from 1.0.5 are retained. Clicking a badge opens that shipment's TrackOrder URL in a new tab. The refund-record fix from 1.0.4 is retained: only actual shop orders are indexed and linked; refunded parent orders remain eligible.
 
 Default source tab: `printify_trackorder_sync`. On upgrade, the previous default `printify_multi_orders` is migrated once; other custom tab names are preserved.
 

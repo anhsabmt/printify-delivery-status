@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Printify Delivery Status
  * Description: Read private Google Sheets and display Printify delivery status in WooCommerce.
- * Version: 1.0.5
+ * Version: 1.0.6
  * Plugin URI: https://github.com/anhsabmt/printify-delivery-status
  * Update URI: https://github.com/anhsabmt/printify-delivery-status
  * Requires at least: 5.8
@@ -63,7 +63,8 @@ final class PDS_Plugin {
                 \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
             }
         });
-        add_action('init', array(__CLASS__, 'schedule'));
+        // init supplies an empty string; schedule's delay is an internal numeric argument.
+        add_action('init', array(__CLASS__, 'schedule'), 10, 0);
         add_action(self::HOOK, array(__CLASS__, 'sync'));
         add_action('admin_menu', array(__CLASS__, 'menu'));
         add_action('admin_post_pds_settings', array(__CLASS__, 'save'));

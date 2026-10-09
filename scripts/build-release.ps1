@@ -1,4 +1,4 @@
-param([string]$Version = '1.0.5')
+param([string]$Version = '1.0.6')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version' }
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -17,6 +17,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Matching checks failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Updater checks failed' }
 & php (Join-Path $projectRoot 'tests\refund-sync-check.php')
 if ($LASTEXITCODE -ne 0) { throw 'Refund sync checks failed' }
+& php (Join-Path $projectRoot 'tests\init-hook-check.php') action-scheduler
+if ($LASTEXITCODE -ne 0) { throw 'Action Scheduler init hook checks failed' }
+& php (Join-Path $projectRoot 'tests\init-hook-check.php') wp-cron
+if ($LASTEXITCODE -ne 0) { throw 'WP-Cron init hook checks failed' }
 $releaseRoot = Join-Path $projectRoot 'releases'
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 Add-Type -AssemblyName System.IO.Compression
