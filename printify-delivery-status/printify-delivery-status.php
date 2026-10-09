@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Printify Delivery Status
  * Description: Read private Google Sheets and display Printify delivery status in WooCommerce.
- * Version: 1.0.4
+ * Version: 1.0.5
  * Plugin URI: https://github.com/anhsabmt/printify-delivery-status
  * Update URI: https://github.com/anhsabmt/printify-delivery-status
  * Requires at least: 5.8
@@ -56,6 +56,8 @@ final class PDS_Plugin {
     }
     public static function boot() {
         add_action('init', array(__CLASS__, 'upgrade'), 5);
+        add_action('init', array(__CLASS__, 'upgrade_sync'), 6);
+        add_action('admin_init', array(__CLASS__, 'resume_manual_sync'));
         add_action('before_woocommerce_init', function () {
             if (class_exists('Automattic\\WooCommerce\\Utilities\\FeaturesUtil')) {
                 \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
@@ -73,11 +75,15 @@ final class PDS_Plugin {
         add_action('manage_woocommerce_page_wc-orders_custom_column', array(__CLASS__, 'column'), 10, 2);
         add_action('woocommerce_admin_order_data_after_order_details', array(__CLASS__, 'panel'));
     }
-    public static function schedule() {
+    public static function schedule($delay = 60) {
         if (!function_exists('wc_get_orders')) { return; }
         if (function_exists('as_schedule_recurring_action') && function_exists('as_has_scheduled_action')) {
-            if (!as_has_scheduled_action(self::HOOK, array(), 'pds')) { as_schedule_recurring_action(time() + 60, HOUR_IN_SECONDS, self::HOOK, array(), 'pds'); }
-        } elseif (!wp_next_scheduled(self::HOOK)) { wp_schedule_event(time() + 60, 'hourly', self::HOOK); }
+            // A running action must not prevent restoring the next hourly run.
+            $pending = function_exists('as_get_scheduled_actions')
+                ? as_get_scheduled_actions(array('hook' => self::HOOK, 'args' => array(), 'group' => 'pds', 'status' => 'pending', 'per_page' => 1), 'ids')
+                : as_has_scheduled_action(self::HOOK, array(), 'pds');
+            if (!$pending) { as_schedule_recurring_action(time() + $delay, HOUR_IN_SECONDS, self::HOOK, array(), 'pds'); }
+        } elseif (!wp_next_scheduled(self::HOOK)) { wp_schedule_event(time() + $delay, 'hourly', self::HOOK); }
     }
     public static function stop() {
         wp_clear_scheduled_hook(self::HOOK);
@@ -98,6 +104,41 @@ final class PDS_Plugin {
         }
         update_option('pds_tab_migration_101', 1, false);
     }
+    public static function upgrade_sync() {
+        if (get_option('pds_sync_ui_version') === PDS_Updater::VERSION) { return; }
+        self::stop(); self::schedule(HOUR_IN_SECONDS);
+        $c = self::config();
+        if (!empty($c['path']) && !empty($c['sheet'])) {
+            update_option('pds_manual_sync_requested', wp_generate_uuid4(), false);
+        }
+        update_option('pds_sync_ui_version', PDS_Updater::VERSION, false);
+    }
+    private static function manual_request() {
+        // Read changes made by a concurrent Save, including previously absent options.
+        wp_cache_delete('pds_manual_sync_requested', 'options');
+        wp_cache_delete('notoptions', 'options');
+        return (string) get_option('pds_manual_sync_requested', '');
+    }
+    private static function finish_manual_request($request) {
+        if (!$request) { return; }
+        // Delete only the request this sync handled. A newer Save must survive.
+        global $wpdb;
+        $wpdb->delete($wpdb->options, array('option_name' => 'pds_manual_sync_requested', 'option_value' => $request), array('%s', '%s'));
+        wp_cache_delete('pds_manual_sync_requested', 'options');
+        wp_cache_delete('notoptions', 'options');
+    }
+    public static function manual_sync() {
+        // Cancel this plugin's pending jobs and restore its hourly schedule.
+        self::stop(); self::schedule(HOUR_IN_SECONDS);
+        update_option('pds_manual_sync_requested', wp_generate_uuid4(), false);
+        return self::sync();
+    }
+    public static function resume_manual_sync() {
+        // Never sync old settings before the Save POST handler has saved new settings.
+        if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET' && current_user_can('manage_woocommerce') && self::manual_request()) {
+            self::sync();
+        }
+    }
     private static function token($path) {
         if (!$path || !is_readable($path)) { throw new Exception('Service account file is not readable. Configure its server path.'); }
         $c = json_decode(file_get_contents($path), true);
@@ -114,14 +155,19 @@ final class PDS_Plugin {
         return $data['access_token'];
     }
     public static function sync() {
-        if (!function_exists('wc_get_orders')) { return; }
+        $request = self::manual_request();
+        if (!function_exists('wc_get_orders')) {
+            $result = array('time' => time(), 'status' => 'error', 'error' => 'WooCommerce must be active to sync.');
+            update_option('pds_result', $result, false); self::finish_manual_request($request); return $result;
+        }
         $lock = time();
         if (!add_option('pds_sync_lock', $lock, '', false)) {
-            if (time() - (int) get_option('pds_sync_lock') < 900) { return; }
+            if (time() - (int) get_option('pds_sync_lock') < 900) { return array('status' => 'busy'); }
             delete_option('pds_sync_lock');
-            if (!add_option('pds_sync_lock', $lock, '', false)) { return; }
+            if (!add_option('pds_sync_lock', $lock, '', false)) { return array('status' => 'busy'); }
         }
         try {
+            if (function_exists('set_time_limit')) { @set_time_limit(120); }
             $c = self::config(); $token = self::token($c['path']);
             $range = "'" . str_replace("'", "''", $c['tab']) . "'!A:AZ";
             $url = 'https://sheets.googleapis.com/v4/spreadsheets/' . rawurlencode($c['sheet']) . '/values/' . rawurlencode($range);
@@ -178,14 +224,10 @@ final class PDS_Plugin {
                 elseif (count($matches) === 1) { $group[$matches[0]][$id] = $source; }
                 else { $reviews[$id] = $source; }
             }
-            // Multiple Printify orders must be explicitly approved before grouping.
-            foreach ($group as $oid => $items) {
-                if (count($items) > 1) {
-                    foreach ($items as $id => $source) {
-                        if (!isset($links[$id])) { $reviews[$id] = $source; unset($group[$oid][$id]); }
-                    }
-                }
-            }
+            // Independently matched source orders can share one WooCommerce order.
+            // Keep each shipment under its own Shop ID + Printify Order ID.
+            // A Save during the Google read/indexing invalidates this old snapshot.
+            if ($request !== self::manual_request()) { return array('status' => 'busy'); }
             foreach ($group as $oid => $items) {
                 if (!$items) { continue; }
                 $o = wc_get_order($oid);
@@ -196,9 +238,13 @@ final class PDS_Plugin {
                 $o->update_meta_data('_pds_shipments', $existing); $o->update_meta_data('_pds_synced', time()); $o->save();
             }
             update_option('pds_links', $links, false); update_option('pds_sources', $sources, false); update_option('pds_reviews', $reviews, false);
-            update_option('pds_result', array('time' => time(), 'error' => '', 'rows' => count($sources), 'review' => count($reviews)), false);
-        } catch (Throwable $e) { update_option('pds_result', array('time' => time(), 'error' => $e->getMessage()), false); }
-        finally { delete_option('pds_sync_lock'); }
+            $result = array('time' => time(), 'status' => 'success', 'error' => '', 'rows' => count($sources), 'review' => count($reviews));
+            update_option('pds_result', $result, false); return $result;
+        } catch (Throwable $e) {
+            $result = array('time' => time(), 'status' => 'error', 'error' => $e->getMessage());
+            update_option('pds_result', $result, false); return $result;
+        }
+        finally { self::finish_manual_request($request); delete_option('pds_sync_lock'); }
     }
     public static function safe_url($url) {
         return strtolower((string) parse_url($url, PHP_URL_HOST)) === 'trackorder.site' && parse_url($url, PHP_URL_SCHEME) === 'https' ? $url : '';
@@ -216,14 +262,14 @@ final class PDS_Plugin {
             $labels = array('in-production' => 'In Production', 'shipment_pre_transit' => 'Awaiting Carrier', 'shipment_in_transit' => 'In Transit', 'shipment_delivered' => 'Delivered', 'fulfilled' => 'Fulfilled');
             $status = $item['status'] ?? ''; $label = $labels[$status] ?? ('Unknown: ' . ($status ?: 'No status'));
             $color = $status === 'shipment_delivered' ? '#d9efda' : '#e5edf7';
-            echo '<div style="margin-bottom:10px"><span style="display:inline-block;padding:4px 8px;border-radius:4px;background:' . esc_attr($color) . '">' . esc_html($label) . '</span>';
-            if (!empty($item['needs_review'])) { echo '<br><strong style="color:#b26200">Needs review: address mismatch</strong>'; }
-            if (!empty($item['url'])) { echo '<br><a target="_blank" rel="noopener noreferrer" href="' . esc_url($item['url']) . '">Tracking ↗</a>'; }
-            if (!empty($item['carrier'])) { echo '<br><small>' . esc_html($item['carrier']) . '</small>'; }
-            if (!empty($item['number'])) { echo '<br><small>…' . esc_html(substr($item['number'], -8)) . '</small>'; }
-            $t = strtotime($item['checked'] ?? '');
-            echo '<br><small>' . ($t ? esc_html(wp_date('M j, H:i', $t)) : 'Not checked') . '</small>';
-            if (!$t || time() - $t > 3 * HOUR_IN_SECONDS) { echo '<br><small style="color:#b26200">Stale</small>'; }
+            $url = self::safe_url($item['url'] ?? '');
+            $style = 'display:inline-block;padding:4px 8px;border-radius:4px;background:' . $color;
+            echo '<div style="margin-bottom:6px">';
+            if ($url) {
+                echo '<a href="' . esc_url($url) . '" target="_blank" rel="noopener noreferrer" style="' . esc_attr($style . ';text-decoration:none') . '">' . esc_html($label) . '</a>';
+            } else {
+                echo '<span style="' . esc_attr($style) . '">' . esc_html($label) . '</span>';
+            }
             echo '</div>';
         }
     }
@@ -232,13 +278,14 @@ final class PDS_Plugin {
     public static function save() {
         self::guard(); check_admin_referer('pds_settings');
         $c = array('path' => sanitize_text_field(wp_unslash($_POST['path'] ?? '')), 'sheet' => sanitize_text_field(wp_unslash($_POST['sheet'] ?? '')), 'tab' => sanitize_text_field(wp_unslash($_POST['tab'] ?? '')));
-        update_option('pds_config', $c, false); wp_safe_redirect(admin_url('admin.php?page=pds')); exit;
+        update_option('pds_config', $c, false);
+        $result = self::manual_sync();
+        wp_safe_redirect(admin_url('admin.php?page=pds&sync=' . $result['status'])); exit;
     }
     public static function queue() {
         self::guard(); check_admin_referer('pds_sync');
-        if (function_exists('as_enqueue_async_action')) { as_enqueue_async_action(self::HOOK, array(), 'pds'); }
-        else { wp_schedule_single_event(time() + 1, self::HOOK); }
-        wp_safe_redirect(admin_url('admin.php?page=pds&queued=1')); exit;
+        $result = self::manual_sync();
+        wp_safe_redirect(admin_url('admin.php?page=pds&sync=' . $result['status'])); exit;
     }
     public static function link() {
         self::guard(); check_admin_referer('pds_link');
@@ -260,14 +307,20 @@ final class PDS_Plugin {
     public static function screen() {
         self::guard(); $c = self::config(); $r = get_option('pds_result', array());
         echo '<div class="wrap"><h1>Printify Delivery</h1><p>Match shipping recipient name + phone, then verify available shipping address fields. Address conflicts and ambiguous matches require review. Manual links override automatic matching. Tracking does not change WooCommerce order status.</p>';
-        if (isset($_GET['queued'])) { echo '<div class="notice notice-info"><p>Sync queued. Refresh this screen after the background job finishes.</p></div>'; }
-        if ($r) { echo '<p>Last attempt: ' . esc_html(wp_date('Y-m-d H:i', $r['time'])) . ' — ' . esc_html($r['error'] ?: ('Success; rows: ' . $r['rows'] . '; needs review: ' . $r['review'])) . '</p>'; }
-        echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="pds_settings">'; wp_nonce_field('pds_settings');
+        $waiting = self::manual_request();
+        if ($waiting) {
+            echo '<div class="notice notice-info"><p>A sync is already running. Your refresh request is saved and will start as soon as it finishes. This page refreshes automatically.</p></div><script>setTimeout(function(){window.location.reload();},3000);</script>';
+        } elseif (isset($_GET['sync']) && $r) {
+            echo '<div class="notice notice-' . (!empty($r['error']) ? 'error' : 'success') . '"><p>' . esc_html($r['error'] ?: 'Sync complete. Delivery statuses are updated.') . '</p></div>';
+        }
+        if ($r) { echo '<p>Last completed attempt: ' . esc_html(wp_date('Y-m-d H:i:s', $r['time'])) . ' — ' . esc_html($r['error'] ?: ('Success; rows: ' . $r['rows'] . '; needs review: ' . $r['review'])) . '</p>'; }
+        echo '<p>Saving settings also syncs immediately. The buttons wait for sync to finish and then show the result.</p>';
+        echo '<form method="post" onsubmit="this.querySelector(\'input[type=submit]\').disabled=true;this.querySelector(\'input[type=submit]\').value=\'Saving and syncing…\';" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="pds_settings">'; wp_nonce_field('pds_settings');
         foreach (array('path' => 'Service account JSON path on this server', 'sheet' => 'Spreadsheet ID', 'tab' => 'Sheet tab') as $key => $label) {
             echo '<p><label>' . esc_html($label) . '<br><input class="large-text" name="' . esc_attr($key) . '" value="' . esc_attr($c[$key]) . '"></label></p>';
         }
-        submit_button('Save settings'); echo '</form><form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="pds_sync">'; wp_nonce_field('pds_sync'); submit_button('Sync now', 'secondary'); echo '</form>';
-        echo '<h2>Review / manual links</h2><p>Source IDs and candidate WooCommerce internal IDs are shown below. Multiple source orders require manual approval before grouping.</p><table class="widefat"><thead><tr><th>Printify source</th><th>Status</th><th>Candidates</th><th>Link to WooCommerce ID</th></tr></thead><tbody>';
+        submit_button('Save & sync now'); echo '</form><form method="post" onsubmit="this.querySelector(\'input[type=submit]\').disabled=true;this.querySelector(\'input[type=submit]\').value=\'Syncing…\';" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="pds_sync">'; wp_nonce_field('pds_sync'); submit_button('Sync now', 'secondary'); echo '</form>';
+        echo '<h2>Review / manual links</h2><p>Multiple source orders matching one WooCommerce order are grouped automatically. Only unmatched, ambiguous or conflicting sources need review. Source IDs and candidate WooCommerce internal IDs are shown below.</p><table class="widefat"><thead><tr><th>Printify source</th><th>Status</th><th>Candidates</th><th>Link to WooCommerce ID</th></tr></thead><tbody>';
         foreach (get_option('pds_sources', array()) as $id => $s) {
             echo '<tr><td>' . esc_html($id) . '</td><td>' . esc_html($s['status']) . '</td><td>' . esc_html(implode(', ', $s['candidates'])) . '</td><td><form method="post" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="pds_link"><input type="hidden" name="source" value="' . esc_attr($id) . '">'; wp_nonce_field('pds_link');
             $links = get_option('pds_links', array()); echo '<input type="number" min="1" required name="order_id" value="' . esc_attr($links[$id] ?? '') . '"><button class="button">Save link</button></form></td></tr>';

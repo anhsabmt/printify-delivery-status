@@ -3,10 +3,10 @@ namespace {
     // A refund deliberately has no shipping or metadata getters.
     class WC_Order_Refund { public function get_type() { return 'shop_order_refund'; } }
     class WC_Order {
-        public $meta = array(); public $saved = 0; public $shipping_reads = 0;
+        public $meta = array(); public $saved = 0; public $shipping_reads = 0; public $id = 5;
         public function get_type() { return 'shop_order'; }
         public function get_status() { return 'refunded'; }
-        public function get_id() { return 5; }
+        public function get_id() { return $this->id; }
         public function get_shipping_first_name() { $this->shipping_reads++; return 'Test'; }
         public function get_shipping_last_name() { return 'Buyer'; }
         public function get_shipping_phone() { return '2025550100'; }
@@ -26,6 +26,7 @@ namespace Automattic\WooCommerce\Admin\Overrides {
 }
 namespace {
     define('ABSPATH', __DIR__);
+    define('HOUR_IN_SECONDS', 3600);
     $options = array(); $queries = array(); $checks = 0;
     $parent = new \Automattic\WooCommerce\Admin\Overrides\Order();
     $refund = new \Automattic\WooCommerce\Admin\Overrides\OrderRefund();
@@ -37,14 +38,46 @@ namespace {
     function get_option($key, $default = false) { return $GLOBALS['options'][$key] ?? $default; }
     function update_option($key, $value) { $GLOBALS['options'][$key] = $value; }
     function delete_option($key) { unset($GLOBALS['options'][$key]); }
+    function wp_cache_delete() {}
+    function wp_generate_uuid4() { static $counter = 0; return 'test-request-' . ++$counter; }
+    class Test_Options_DB {
+        public $options = 'test_options';
+        public function delete($table, $where, $formats) {
+            $key = $where['option_name'];
+            if (get_option($key) === $where['option_value']) { delete_option($key); return 1; }
+            return 0;
+        }
+    }
+    $wpdb = new Test_Options_DB();
+    $jobs = array(); $cron = array();
+    function wp_clear_scheduled_hook($hook) { unset($GLOBALS['cron'][$hook]); }
+    function as_unschedule_all_actions($hook, $args, $group) {
+        foreach ($GLOBALS['jobs'] as $id => $job) {
+            if ($job['hook'] === $hook && $job['group'] === $group && $job['status'] === 'pending') { unset($GLOBALS['jobs'][$id]); }
+        }
+    }
+    function as_get_scheduled_actions($query, $format) {
+        return array_keys(array_filter($GLOBALS['jobs'], function ($job) use ($query) {
+            return $job['hook'] === $query['hook'] && $job['group'] === $query['group'] && $job['status'] === $query['status'];
+        }));
+    }
+    function as_has_scheduled_action($hook, $args, $group) {
+        foreach ($GLOBALS['jobs'] as $job) { if ($job['hook'] === $hook && $job['group'] === $group) { return true; } }
+        return false;
+    }
+    function as_schedule_recurring_action($time, $interval, $hook, $args, $group) {
+        $GLOBALS['jobs'][] = array('hook' => $hook, 'group' => $group, 'status' => 'pending', 'time' => $time, 'interval' => $interval);
+    }
     function add_option($key, $value) {
         if (array_key_exists($key, $GLOBALS['options'])) { return false; }
         $GLOBALS['options'][$key] = $value; return true;
     }
     function wp_parse_args($value, $defaults) { return array_merge($defaults, $value); }
     function wp_json_encode($value) { return json_encode($value); }
-    function wp_remote_post() { return array('code' => 200, 'body' => '{"access_token":"test-only"}'); }
+    function wp_remote_post() { $GLOBALS['auth_calls'] = ($GLOBALS['auth_calls'] ?? 0) + 1; return array('code' => 200, 'body' => '{"access_token":"test-only"}'); }
     function wp_remote_get() {
+        if (!empty($GLOBALS['on_google_read'])) { call_user_func($GLOBALS['on_google_read']); }
+        if (isset($GLOBALS['sheet_response'])) { return $GLOBALS['sheet_response']; }
         $headers = array('Order ID', 'Shop ID', 'Customer', 'Phone', 'Country Code', 'Address 1', 'Postcode', 'TrackOrder Latest Status', 'TrackOrder URL', 'TrackOrder Checked At');
         $rows = array(
             $headers,
@@ -59,7 +92,9 @@ namespace {
     function wc_get_orders($args) {
         $GLOBALS['queries'][] = $args;
         // Simulate a third-party query filter returning refunds despite type restrictions.
-        return (object) array('orders' => $args['page'] === 1 ? array($GLOBALS['refund'], false, new \stdClass()) : array($GLOBALS['parent']), 'max_num_pages' => 2);
+        $valid = array($GLOBALS['parent']);
+        if (!empty($GLOBALS['duplicate_order'])) { $valid[] = $GLOBALS['duplicate_order']; }
+        return (object) array('orders' => $args['page'] === 1 ? array($GLOBALS['refund'], false, new \stdClass()) : $valid, 'max_num_pages' => 2);
     }
     function wc_get_order($id) {
         return (int) $id === 5 ? $GLOBALS['parent'] : ((int) $id === 99 ? $GLOBALS['refund'] : false);
@@ -70,6 +105,12 @@ namespace {
     function wp_unslash($value) { return $value; }
     function absint($value) { return abs((int) $value); }
     function wp_die($message) { throw new \RuntimeException($message); }
+    function esc_html($value) { return htmlspecialchars($value, ENT_QUOTES, 'UTF-8'); }
+    function esc_attr($value) { return esc_html($value); }
+    function esc_url($value) { return esc_html($value); }
+    class Test_Redirect extends \RuntimeException {}
+    function admin_url($path) { return 'https://store.example.invalid/wp-admin/' . $path; }
+    function wp_safe_redirect($url) { throw new Test_Redirect($url); }
     function verify_sync($ok, $message) {
         if (!$ok) { throw new \RuntimeException('Failed: ' . $message); }
         $GLOBALS['checks']++;
@@ -103,6 +144,84 @@ namespace {
         $_POST = array('source' => 'test-shop:test-1', 'order_id' => 99);
         try { PDS_Plugin::link(); throw new \RuntimeException('Refund link was accepted'); }
         catch (\RuntimeException $e) { verify_sync(strpos($e->getMessage(), 'Refund records cannot be linked') !== false, 'manual refund link blocked'); }
-        echo "$checks refund sync checks passed\n";
+        // Several independently matched source orders must all link automatically.
+        $options['pds_links'] = array(); $options['pds_manual_links'] = array();
+        $result = PDS_Plugin::sync();
+        verify_sync($result['status'] === 'success' && $result['review'] === 0, 'split orders do not require approval');
+        verify_sync(count($parent->meta['_pds_shipments']) === 2, 'both shipments retained separately');
+        verify_sync($options['pds_links']['test-shop:test-1'] === 5 && $options['pds_links']['test-shop:test-2'] === 5, 'both automatic links persisted');
+        verify_sync($parent->meta['_pds_shipments']['test-shop:test-2']['status'] === 'shipment_delivered', 'second shipment has independent status');
+        PDS_Plugin::sync();
+        verify_sync(count($parent->meta['_pds_shipments']) === 2, 'repeat sync does not duplicate shipments');
+        // A source matching two Woo orders remains ambiguous.
+        $duplicate_order = new WC_Order(); $duplicate_order->id = 6;
+        $options['pds_links'] = array();
+        $result = PDS_Plugin::sync();
+        verify_sync($result['review'] === 2 && !$options['pds_links'], 'ambiguous Woo matches still require review');
+        unset($duplicate_order);
+        $jobs = array(
+            'old' => array('hook' => PDS_Plugin::HOOK, 'group' => 'pds', 'status' => 'pending'),
+            'active' => array('hook' => PDS_Plugin::HOOK, 'group' => 'pds', 'status' => 'in-progress'),
+            'other' => array('hook' => 'other_plugin', 'group' => 'other', 'status' => 'pending'),
+        );
+        $cron[PDS_Plugin::HOOK] = time(); $cron['other_plugin'] = time();
+        $result = PDS_Plugin::manual_sync();
+        verify_sync($result['status'] === 'success' && isset($options['pds_result']['time']), 'manual sync completes directly');
+        verify_sync(!isset($jobs['old']) && isset($jobs['active'], $jobs['other']), 'only plugin pending jobs cancelled');
+        verify_sync(!isset($cron[PDS_Plugin::HOOK]) && isset($cron['other_plugin']), 'only plugin cron cleared');
+        $pending = as_get_scheduled_actions(array('hook' => PDS_Plugin::HOOK, 'group' => 'pds', 'status' => 'pending'), 'ids');
+        verify_sync(count($pending) === 1 && $jobs[$pending[0]]['interval'] === 3600 && $jobs[$pending[0]]['time'] >= time() + 3599, 'hourly schedule restored even with active action');
+        verify_sync(!isset($options['pds_manual_sync_requested']), 'handled manual request cleared');
+        $options['pds_sync_lock'] = time(); $active_lock = $options['pds_sync_lock'];
+        $before = $auth_calls;
+        verify_sync(PDS_Plugin::manual_sync()['status'] === 'busy' && $auth_calls === $before, 'busy click does not start concurrent sync');
+        verify_sync($options['pds_sync_lock'] === $active_lock && !empty($options['pds_manual_sync_requested']), 'active lock retained and refresh intent saved');
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        PDS_Plugin::resume_manual_sync();
+        verify_sync($auth_calls === $before, 'admin POST never refreshes old configuration');
+        delete_option('pds_sync_lock'); $_SERVER['REQUEST_METHOD'] = 'GET';
+        PDS_Plugin::resume_manual_sync();
+        verify_sync($auth_calls === $before + 1 && !isset($options['pds_manual_sync_requested']), 'next admin GET completes busy refresh');
+        $saved = $parent->saved;
+        $on_google_read = function () { update_option('pds_manual_sync_requested', 'newer-save'); };
+        $result = PDS_Plugin::manual_sync();
+        verify_sync($result['status'] === 'busy' && $parent->saved === $saved, 'superseded sync does not write old snapshot');
+        verify_sync(get_option('pds_manual_sync_requested') === 'newer-save', 'old request cleanup cannot erase newer save');
+        unset($on_google_read);
+        PDS_Plugin::resume_manual_sync();
+        verify_sync($parent->saved === $saved + 1 && !isset($options['pds_manual_sync_requested']), 'newest request completes automatically');
+        $options['pds_sync_lock'] = time() - 901;
+        verify_sync(PDS_Plugin::manual_sync()['status'] === 'success' && !isset($options['pds_sync_lock']), 'expired lock recovered without manual cleanup');
+        $sheet_response = array('code' => 403, 'body' => '{}');
+        $saved = $parent->saved;
+        verify_sync(PDS_Plugin::manual_sync()['status'] === 'error' && $parent->saved === $saved, 'Google error returned immediately and prior data preserved');
+        verify_sync(!isset($options['pds_manual_sync_requested']) && !isset($options['pds_sync_lock']), 'failed attempt clears handled request and lock');
+        unset($sheet_response);
+        $_POST = array('path' => $temp, 'sheet' => 'new-test-sheet', 'tab' => 'printify_trackorder_sync');
+        $before = $auth_calls;
+        try { PDS_Plugin::save(); } catch (Test_Redirect $e) { verify_sync(strpos($e->getMessage(), 'sync=success') !== false, 'save redirects with completed result'); }
+        verify_sync($auth_calls === $before + 1 && $options['pds_config']['sheet'] === 'new-test-sheet', 'save stores configuration and syncs in same request');
+        $before = $auth_calls;
+        try { PDS_Plugin::queue(); } catch (Test_Redirect $e) { verify_sync(strpos($e->getMessage(), 'sync=success') !== false, 'sync now redirects with completed result'); }
+        verify_sync($auth_calls === $before + 1, 'sync now directly calls sync');
+        PDS_Plugin::upgrade_sync();
+        verify_sync(!empty($options['pds_manual_sync_requested']), 'upgrade requests configured refresh');
+        $request = $options['pds_manual_sync_requested']; PDS_Plugin::upgrade_sync();
+        verify_sync($options['pds_manual_sync_requested'] === $request, 'same version does not repeatedly request refresh');
+        PDS_Plugin::resume_manual_sync();
+        verify_sync(!isset($options['pds_manual_sync_requested']) && $options['pds_result']['status'] === 'success', 'upgrade refresh finishes on first admin GET');
+        // Badge-only rendering with a distinct link for each shipment.
+        $items = $parent->meta['_pds_shipments']; $n = 0;
+        foreach ($items as &$item) { $item['url'] = 'https://trackorder.site/fixture-' . ++$n; $item['number'] = 'HIDDEN-NUMBER'; $item['carrier'] = 'HIDDEN-CARRIER'; $item['needs_review'] = true; }
+        unset($item); $parent->meta['_pds_shipments'] = $items;
+        ob_start(); PDS_Plugin::column('pds_delivery', $parent); $html = ob_get_clean();
+        verify_sync(substr_count($html, '<a ') === 2 && strpos($html, 'fixture-1') !== false && strpos($html, 'fixture-2') !== false, 'each status badge opens its own source URL');
+        verify_sync(strpos($html, 'In Transit') !== false && strpos($html, 'Delivered') !== false, 'both shipment statuses displayed');
+        verify_sync(strpos($html, 'HIDDEN-') === false && strpos($html, 'Stale') === false && strpos($html, 'Needs review') === false && strpos($html, '2026-') === false, 'tracking and supplementary fields hidden');
+        verify_sync(substr_count($html, 'target="_blank" rel="noopener noreferrer"') === 2, 'tracking links open safely in new tabs');
+        $parent->meta['_pds_shipments'] = array(array('status' => '<script>bad</script>', 'url' => 'https://malicious.example/'));
+        ob_start(); PDS_Plugin::column('pds_delivery', $parent); $html = ob_get_clean();
+        verify_sync(strpos($html, '<a ') === false && strpos($html, '<script>') === false, 'invalid URL omitted and status escaped');
+        echo "$checks refund, split shipment, immediate sync and badge checks passed\n";
     } finally { if (is_file($temp)) { unlink($temp); } }
 }

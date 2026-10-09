@@ -1,4 +1,4 @@
-param([string]$Version = '1.0.4')
+param([string]$Version = '1.0.5')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version' }
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -19,6 +19,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Updater checks failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Refund sync checks failed' }
 $releaseRoot = Join-Path $projectRoot 'releases'
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zipFile = Join-Path $releaseRoot "printify-delivery-status-$Version.zip"
 $stream = [System.IO.File]::Open($zipFile, [System.IO.FileMode]::Create)
