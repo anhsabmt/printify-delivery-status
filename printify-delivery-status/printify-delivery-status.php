@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Printify Delivery Status
  * Description: Read private Google Sheets and display Printify delivery status in WooCommerce.
- * Version: 1.0.6
+ * Version: 1.0.7
  * Plugin URI: https://github.com/anhsabmt/printify-delivery-status
  * Update URI: https://github.com/anhsabmt/printify-delivery-status
  * Requires at least: 5.8
@@ -18,6 +18,9 @@ final class PDS_Plugin {
     const SHEET = '';
     public static function is_delivery_order($order) {
         return $order instanceof WC_Order && !($order instanceof WC_Order_Refund) && $order->get_type() === 'shop_order';
+    }
+    public static function is_canceled_status($status) {
+        return in_array(strtolower(trim((string) $status)), array('canceled', 'cancelled'), true);
     }
     public static function name_key($value) {
         return preg_replace('/\s+/u', ' ', trim(function_exists('mb_strtolower') ? mb_strtolower($value, 'UTF-8') : strtolower($value)));
@@ -195,12 +198,16 @@ final class PDS_Plugin {
                     $addresses[$o->get_id()] = array('Address 1' => $o->get_shipping_address_1(), 'Address 2' => $o->get_shipping_address_2(), 'Postcode' => $o->get_shipping_postcode(), 'Country Code' => $o->get_shipping_country());
                 }
             } while ($page <= (int) $orders->max_num_pages);
-            $links = get_option('pds_links', array()); $sources = array(); $group = array(); $reviews = array();
+            $links = get_option('pds_links', array()); $sources = array(); $group = array(); $reviews = array(); $canceled = array();
             $manual = get_option('pds_manual_links', array());
             foreach ($d['values'] as $row) {
                 $v = array(); foreach ($headers as $i => $h) { $v[$h] = isset($row[$i]) ? (string) $row[$i] : ''; }
                 if (empty($v['Order ID'])) { continue; }
                 $id = ($v['Shop ID'] ?? $v['Shop'] ?? '') . ':' . $v['Order ID'];
+                // Order cancellation takes precedence over stale tracking information.
+                if (self::is_canceled_status($v['Status'] ?? '') || self::is_canceled_status($v['TrackOrder Status'] ?? '') || self::is_canceled_status($v['TrackOrder Latest Status'])) {
+                    $canceled[$id] = true; continue;
+                }
                 if (isset($sources[$id])) { throw new Exception('Duplicate source Order ID. Previous data was preserved.'); }
                 $key = self::key($v['Customer'], $v['Phone'], $v['Country Code']);
                 $matches = $key ? ($index[$key] ?? array()) : array();
@@ -229,16 +236,32 @@ final class PDS_Plugin {
             // Keep each shipment under its own Shop ID + Printify Order ID.
             // A Save during the Google read/indexing invalidates this old snapshot.
             if ($request !== self::manual_request()) { return array('status' => 'busy'); }
+            // If an active row shares the same source ID, keep that row regardless of row order.
+            $canceled = array_diff_key($canceled, $sources);
+            foreach ($canceled as $id => $unused) {
+                if (isset($links[$id])) {
+                    $oid = (int) $links[$id];
+                    if (!isset($group[$oid])) { $group[$oid] = array(); }
+                }
+                unset($links[$id], $manual[$id]);
+            }
             foreach ($group as $oid => $items) {
-                if (!$items) { continue; }
                 $o = wc_get_order($oid);
-                if (!self::is_delivery_order($o)) { throw new Exception('Linked WooCommerce order is unavailable. Previous tracking was preserved.'); }
+                if (!self::is_delivery_order($o)) {
+                    if (!$items) { continue; } // An obsolete canceled link can point to a deleted order or refund.
+                    throw new Exception('Linked WooCommerce order is unavailable. Previous tracking was preserved.');
+                }
                 $existing = $o->get_meta('_pds_shipments');
-                $existing = is_array($existing) ? $existing : array();
+                $existing = is_array($existing) ? array_diff_key($existing, $canceled) : array();
                 foreach ($items as $id => $item) { $existing[$id] = $item; $links[$id] = $oid; }
                 $o->update_meta_data('_pds_shipments', $existing); $o->update_meta_data('_pds_synced', time()); $o->save();
             }
-            update_option('pds_links', $links, false); update_option('pds_sources', $sources, false); update_option('pds_reviews', $reviews, false);
+            update_option('pds_links', $links, false);
+            if ($canceled) {
+                wp_cache_delete('pds_manual_links', 'options');
+                update_option('pds_manual_links', array_diff_key(get_option('pds_manual_links', array()), $canceled), false);
+            }
+            update_option('pds_sources', $sources, false); update_option('pds_reviews', $reviews, false);
             $result = array('time' => time(), 'status' => 'success', 'error' => '', 'rows' => count($sources), 'review' => count($reviews));
             update_option('pds_result', $result, false); return $result;
         } catch (Throwable $e) {

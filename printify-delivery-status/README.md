@@ -1,6 +1,6 @@
-# Printify Delivery Status 1.0.6
+# Printify Delivery Status 1.0.7
 
-1.0.6 fixes a PHP 8 fatal error during WordPress initialization: `init` supplies an empty string, which 1.0.5 incorrectly treated as the numeric scheduling delay. The callback now accepts zero hook arguments and uses its default delay. Regression checks cover both Action Scheduler and WP-Cron.
+1.0.7 excludes canceled source orders before matching and removes their previously saved shipment data and links after a successful sync. Active replacements remain eligible, whether shipped or in production. The PHP 8 initialization fix from 1.0.6 is retained: the scheduler callback accepts zero init hook arguments and uses its numeric default delay. Regression checks cover both Action Scheduler and WP-Cron.
 
 Immediate Save/Sync, automatic grouping of multiple source shipments matching one WooCommerce order, and clickable status-only badges from 1.0.5 are retained. Clicking a badge opens that shipment's TrackOrder URL in a new tab. The refund-record fix from 1.0.4 is retained: only actual shop orders are indexed and linked; refunded parent orders remain eligible.
 
@@ -23,6 +23,8 @@ Default source tab: `printify_trackorder_sync`. On upgrade, the previous default
 - Existing automatic links with newly conflicting addresses stop updating and appear in the review results. Confirmed manual links override matching. Older links created manually before 1.0.2 should be re-saved to mark them as manual overrides.
 - Case and whitespace normalization; US/CA leading 1 normalization. No fuzzy name matching.
 - A source matching multiple WooCommerce orders remains ambiguous and is not automatically assigned. Multiple distinct sources uniquely matching the same WooCommerce order are linked automatically, each retaining its own tracking and status.
+- A row with `canceled` or `cancelled` in Status, TrackOrder Status or TrackOrder Latest Status is ignored, with case and surrounding whitespace normalized. Cancellation overrides stale production or shipping information. These rows are excluded from matching, source lists and review results, even if previously linked manually.
+- Successful sync removes canceled source shipments and links, preserving other shipments on the same WooCommerce order. A sheet containing only canceled orders still performs this cleanup. A canceled and active row sharing the exact same Shop ID + Order ID keeps the active row regardless of row order; duplicate active rows remain an error and preserve previous data. Google errors or invalid sheets do not trigger cancellation cleanup.
 - Existing links persist by Shop ID + Printify Order ID, including when rows are sorted.
 - No match is displayed until linked. Each linked source has its own status badge and TrackOrder link, even when statuses are identical. A missing or invalid URL leaves a plain badge.
 - The delivery column and order panel display status badges only. Tracking numbers, carrier names, checked times and supplementary labels are hidden; tracking data remains stored internally. The existing shipment-tracking plugin is unaffected.

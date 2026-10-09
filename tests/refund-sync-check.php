@@ -222,6 +222,72 @@ namespace {
         $parent->meta['_pds_shipments'] = array(array('status' => '<script>bad</script>', 'url' => 'https://malicious.example/'));
         ob_start(); PDS_Plugin::column('pds_delivery', $parent); $html = ob_get_clean();
         verify_sync(strpos($html, '<a ') === false && strpos($html, '<script>') === false, 'invalid URL omitted and status escaped');
-        echo "$checks refund, split shipment, immediate sync and badge checks passed\n";
+        // Canceled retries must not compete with the replacement order, even with stale tracking.
+        $parent = new \Automattic\WooCommerce\Admin\Overrides\Order();
+        $sheetFixture = function ($fixtureRows) {
+            $headers = array('Order ID', 'Shop ID', 'Customer', 'Phone', 'Country Code', 'Address 1', 'Postcode', 'Status', 'TrackOrder Status', 'TrackOrder Latest Status', 'TrackOrder URL', 'TrackOrder Checked At', 'Tracking Number');
+            $values = array($headers);
+            foreach ($fixtureRows as $row) {
+                $row = array_merge(array('Shop ID' => 'test-shop', 'Customer' => 'Test Buyer', 'Phone' => '2025550100', 'Country Code' => 'US', 'Address 1' => '100 Example Ave', 'Postcode' => '00000', 'Status' => 'in-production', 'TrackOrder Latest Status' => 'in-production', 'TrackOrder Checked At' => '2026-10-09T00:00:00Z'), $row);
+                $values[] = array_map(function ($header) use ($row) { return $row[$header] ?? ''; }, $headers);
+            }
+            return array('code' => 200, 'body' => json_encode(array('values' => $values)));
+        };
+        unset($sheet_response); PDS_Plugin::sync();
+        $options['pds_manual_links'] = array('test-shop:test-1' => true, 'test-shop:test-2' => true);
+        $sheet_response = $sheetFixture(array(
+            array('Order ID' => 'test-1', 'Status' => ' canceled ', 'TrackOrder Latest Status' => 'in-production', 'Tracking Number' => 'CANCELED-NUMBER'),
+            array('Order ID' => 'test-2', 'Status' => 'fulfilled', 'TrackOrder Latest Status' => 'shipment_in_transit', 'Tracking Number' => 'ACTIVE-NUMBER'),
+        ));
+        $result = PDS_Plugin::sync();
+        verify_sync($result['status'] === 'success' && $result['rows'] === 1 && $result['review'] === 0, 'canceled row excluded before matching and review');
+        verify_sync(count($parent->meta['_pds_shipments']) === 1 && isset($parent->meta['_pds_shipments']['test-shop:test-2']), 'previously stored canceled shipment removed');
+        verify_sync($parent->meta['_pds_shipments']['test-shop:test-2']['number'] === 'ACTIVE-NUMBER', 'shipped replacement tracking retained');
+        verify_sync(!isset($options['pds_links']['test-shop:test-1']) && !isset($options['pds_manual_links']['test-shop:test-1']) && !isset($options['pds_sources']['test-shop:test-1']), 'canceled links and source data removed');
+        verify_sync(!empty($options['pds_manual_links']['test-shop:test-2']), 'active manual link preserved');
+        $sheet_response = $sheetFixture(array(
+            array('Order ID' => 'test-1', 'Status' => 'CaNcElLeD', 'TrackOrder Latest Status' => 'shipment_delivered'),
+            array('Order ID' => 'test-2', 'TrackOrder Latest Status' => 'in-production'),
+        ));
+        PDS_Plugin::sync();
+        verify_sync(count($parent->meta['_pds_shipments']) === 1 && $parent->meta['_pds_shipments']['test-shop:test-2']['status'] === 'in-production', 'cancelled spelling skipped while production replacement retained');
+        $sheet_response = $sheetFixture(array(
+            array('Order ID' => 'test-1', 'Status' => '', 'TrackOrder Latest Status' => 'cancelled'),
+            array('Order ID' => 'test-2', 'TrackOrder Latest Status' => 'shipment_delivered'),
+        ));
+        verify_sync(PDS_Plugin::sync()['rows'] === 1, 'tracking latest cancellation also excluded');
+        $sheet_response = $sheetFixture(array(
+            array('Order ID' => 'test-1', 'Status' => '', 'TrackOrder Status' => 'canceled', 'TrackOrder Latest Status' => 'in-production'),
+            array('Order ID' => 'test-2'),
+        ));
+        verify_sync(PDS_Plugin::sync()['rows'] === 1, 'tracking overall cancellation overrides stale latest tracking');
+        $parent->meta['_pds_shipments']['other-shop:test-1'] = array('status' => 'shipment_in_transit');
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-1', 'Status' => 'canceled'), array('Order ID' => 'test-2', 'Status' => 'cancelled')));
+        $result = PDS_Plugin::sync();
+        verify_sync($result['status'] === 'success' && $result['rows'] === 0 && $result['review'] === 0, 'all-canceled sheet is a successful cleanup');
+        verify_sync(count($parent->meta['_pds_shipments']) === 1 && isset($parent->meta['_pds_shipments']['other-shop:test-1']), 'cleanup preserves unrelated shop source with same Order ID');
+        verify_sync(!$options['pds_links'] && !$options['pds_manual_links'] && !$options['pds_sources'] && !$options['pds_reviews'], 'all canceled source options cleared');
+        // Same source ID on a canceled row and an active row must work in either order.
+        $duplicateRows = array(array('Order ID' => 'test-1', 'Status' => 'canceled'), array('Order ID' => 'test-1', 'Status' => 'in-production', 'Tracking Number' => 'REPLACEMENT'));
+        foreach (array($duplicateRows, array_reverse($duplicateRows)) as $rowOrder) {
+            $sheet_response = $sheetFixture($rowOrder); $result = PDS_Plugin::sync();
+            verify_sync($result['status'] === 'success' && $result['rows'] === 1 && $parent->meta['_pds_shipments']['test-shop:test-1']['number'] === 'REPLACEMENT', 'active same-ID row survives canceled row regardless of position');
+        }
+        $oldMeta = $parent->meta; $oldLinks = $options['pds_links'];
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-1', 'Status' => 'canceled'), array('Order ID' => 'test-2'), array('Order ID' => 'test-2')));
+        $result = PDS_Plugin::sync();
+        verify_sync($result['status'] === 'error' && $parent->meta === $oldMeta && $options['pds_links'] === $oldLinks, 'invalid active duplicates preserve old tracking before cancellation cleanup');
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-1', 'Status' => 'canceled')));
+        $on_google_read = function () { update_option('pds_manual_sync_requested', 'newer-cancel-save'); };
+        $result = PDS_Plugin::manual_sync();
+        verify_sync($result['status'] === 'busy' && $parent->meta === $oldMeta && $options['pds_links'] === $oldLinks, 'superseded sync cannot delete canceled tracking');
+        unset($on_google_read);
+        PDS_Plugin::resume_manual_sync();
+        verify_sync(!isset($parent->meta['_pds_shipments']['test-shop:test-1']) && !isset($options['pds_links']['test-shop:test-1']), 'latest authorized sync removes canceled tracking');
+        $options['pds_links'] = array('test-shop:test-1' => 99);
+        verify_sync(PDS_Plugin::sync()['status'] === 'success' && !$options['pds_links'], 'canceled old refund link removed without refund getters');
+        unset($sheet_response); PDS_Plugin::sync();
+        verify_sync(isset($parent->meta['_pds_shipments']['test-shop:test-1'], $parent->meta['_pds_shipments']['test-shop:test-2']), 'active sources can be matched again after cancellation is removed');
+        echo "$checks refund, split shipment, immediate sync, badge and cancellation checks passed\n";
     } finally { if (is_file($temp)) { unlink($temp); } }
 }

@@ -7,6 +7,11 @@ function wp_salt() { return 'test-only'; }
 function plugin_basename($file) { return basename(dirname($file)) . '/' . basename($file); }
 require __DIR__ . '/../printify-delivery-status/printify-delivery-status.php';
 $checks = array(
+    PDS_Plugin::is_canceled_status('canceled'),
+    PDS_Plugin::is_canceled_status(' CANCELLED '),
+    !PDS_Plugin::is_canceled_status('in-production'),
+    !PDS_Plugin::is_canceled_status('shipment_in_transit'),
+    !PDS_Plugin::is_canceled_status('cancel_requested') && !PDS_Plugin::is_canceled_status('not canceled'),
     PDS_Plugin::address_matches(array('Address 1' => '100 Example Avenue', 'Postcode' => '00000', 'Country Code' => 'US'), array('Address 1' => '100 example ave.', 'Postcode' => '00000', 'Country Code' => 'US')),
     !PDS_Plugin::address_matches(array('Address 1' => '100 Example Avenue'), array('Address 1' => '101 Example Ave')),
     !PDS_Plugin::address_matches(array('Address 2' => 'Apt 649'), array('Address 2' => 'Apt 650')),
