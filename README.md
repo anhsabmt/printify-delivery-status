@@ -2,7 +2,7 @@
 
 WooCommerce plugin displaying delivery statuses from a configured Google Sheet in the order list. Supports legacy order storage and HPOS. Reads Google Sheets; does not modify source rows or WooCommerce order status.
 
-Latest: **1.0.4** fixes sync errors caused by refund records. Only actual shop orders are indexed and linked; refunded parent orders can still be tracked.
+Latest published: **1.0.3**. Version **1.0.4** has been prepared locally to fix refund synchronization, but is not yet published on GitHub. Only actual shop orders are indexed and linked; refunded parent orders can still be tracked.
 
 ## Installation and updates
 
