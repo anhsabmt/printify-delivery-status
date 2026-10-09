@@ -2,6 +2,8 @@
 
 WooCommerce plugin displaying delivery statuses from a configured Google Sheet in the order list. Supports legacy order storage and HPOS. Reads Google Sheets; does not modify source rows or WooCommerce order status.
 
+Latest: **1.0.4** fixes sync errors caused by refund records. Only actual shop orders are indexed and linked; refunded parent orders can still be tracked.
+
 ## Installation and updates
 
 1. Download **printify-delivery-status.zip** from [Releases](https://github.com/anhsabmt/printify-delivery-status/releases/latest). Do not use the automatic GitHub source-code ZIP.
