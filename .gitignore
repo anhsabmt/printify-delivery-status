@@ -1,0 +1,14 @@
+# Explicit allowlist: this workspace also holds credentials and local customer data.
+/*
+!/.gitignore
+!/README.md
+!/printify-delivery-status/
+!/tests/
+!/scripts/
+!/.github/
+!/releases/
+**/*.json
+**/node_modules/
+**/*.pem
+**/*.key
+**/.env*
