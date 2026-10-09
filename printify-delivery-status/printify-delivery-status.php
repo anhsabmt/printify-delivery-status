@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Printify Delivery Status
  * Description: Read private Google Sheets and display Printify delivery status in WooCommerce.
- * Version: 1.0.3
+ * Version: 1.0.4
  * Plugin URI: https://github.com/anhsabmt/printify-delivery-status
  * Update URI: https://github.com/anhsabmt/printify-delivery-status
  * Requires at least: 5.8
@@ -16,6 +16,9 @@ PDS_Updater::boot(__FILE__);
 final class PDS_Plugin {
     const HOOK = 'pds_hourly_sync';
     const SHEET = '';
+    public static function is_delivery_order($order) {
+        return $order instanceof WC_Order && !($order instanceof WC_Order_Refund) && $order->get_type() === 'shop_order';
+    }
     public static function name_key($value) {
         return preg_replace('/\s+/u', ' ', trim(function_exists('mb_strtolower') ? mb_strtolower($value, 'UTF-8') : strtolower($value)));
     }
@@ -133,8 +136,10 @@ final class PDS_Plugin {
             // Build one index per sync; never query Google while rendering Orders.
             $index = array(); $addresses = array(); $page = 1;
             do {
-                $orders = wc_get_orders(array('limit' => 100, 'page' => $page++, 'paginate' => true, 'orderby' => 'ID', 'order' => 'ASC'));
+                $orders = wc_get_orders(array('type' => 'shop_order', 'return' => 'objects', 'limit' => 100, 'page' => $page++, 'paginate' => true, 'orderby' => 'ID', 'order' => 'ASC'));
                 foreach ($orders->orders as $o) {
+                    // Refunds have no shipping getters; also guard results changed by other plugins.
+                    if (!self::is_delivery_order($o)) { continue; }
                     $name = trim($o->get_shipping_first_name() . ' ' . $o->get_shipping_last_name());
                     $phone = method_exists($o, 'get_shipping_phone') ? $o->get_shipping_phone() : '';
                     if (!$phone) { $phone = $o->get_billing_phone(); }
@@ -155,13 +160,15 @@ final class PDS_Plugin {
                 $matches = array_values(array_filter($matches, function ($oid) use ($v, $addresses) { return self::address_matches($v, $addresses[$oid]); }));
                 $source = array('id' => $id, 'printify_id' => $v['Order ID'], 'status' => $v['TrackOrder Latest Status'], 'url' => self::safe_url($v['TrackOrder URL']), 'number' => $v['Tracking Number'] ?? '', 'carrier' => $v['Tracking Carrier'] ?? '', 'updated' => $v['TrackOrder Latest Update'] ?? '', 'checked' => $v['TrackOrder Checked At'], 'candidates' => $matches);
                 $sources[$id] = $source;
-                if (isset($links[$id]) && wc_get_order($links[$id])) {
+                if (isset($links[$id])) {
                     $oid = (int) $links[$id];
-                    if (!empty($manual[$id]) || (isset($addresses[$oid]) && self::address_matches($v, $addresses[$oid]))) {
+                    $linked = wc_get_order($oid);
+                    if (self::is_delivery_order($linked) && (!empty($manual[$id]) || (isset($addresses[$oid]) && self::address_matches($v, $addresses[$oid])))) {
                         $group[$oid][$id] = $source;
                     } else {
                         $reviews[$id] = $source;
-                        $old = wc_get_order($oid); $old_items = $old->get_meta('_pds_shipments');
+                        if (!self::is_delivery_order($linked)) { continue; }
+                        $old = $linked; $old_items = $old->get_meta('_pds_shipments');
                         if (is_array($old_items) && isset($old_items[$id])) {
                             $old_items[$id]['needs_review'] = true;
                             $old->update_meta_data('_pds_shipments', $old_items); $old->save();
@@ -181,7 +188,9 @@ final class PDS_Plugin {
             }
             foreach ($group as $oid => $items) {
                 if (!$items) { continue; }
-                $o = wc_get_order($oid); $existing = $o->get_meta('_pds_shipments');
+                $o = wc_get_order($oid);
+                if (!self::is_delivery_order($o)) { throw new Exception('Linked WooCommerce order is unavailable. Previous tracking was preserved.'); }
+                $existing = $o->get_meta('_pds_shipments');
                 $existing = is_array($existing) ? $existing : array();
                 foreach ($items as $id => $item) { $existing[$id] = $item; $links[$id] = $oid; }
                 $o->update_meta_data('_pds_shipments', $existing); $o->update_meta_data('_pds_synced', time()); $o->save();
@@ -235,7 +244,7 @@ final class PDS_Plugin {
         self::guard(); check_admin_referer('pds_link');
         $id = sanitize_text_field(wp_unslash($_POST['source'] ?? '')); $oid = absint($_POST['order_id'] ?? 0);
         $sources = get_option('pds_sources', array()); $o = wc_get_order($oid);
-        if (!$o || !isset($sources[$id])) { wp_die('Invalid source or WooCommerce order ID'); }
+        if (!self::is_delivery_order($o) || !isset($sources[$id])) { wp_die('Invalid source or WooCommerce order ID. Refund records cannot be linked.'); }
         $links = get_option('pds_links', array());
         if (isset($links[$id]) && (int) $links[$id] !== $oid) {
             $old = wc_get_order($links[$id]);

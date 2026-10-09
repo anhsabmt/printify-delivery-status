@@ -1,4 +1,4 @@
-param([string]$Version = '1.0.3')
+param([string]$Version = '1.0.4')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version' }
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -15,6 +15,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Updater lint failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Matching checks failed' }
 & php (Join-Path $projectRoot 'tests\updater-check.php')
 if ($LASTEXITCODE -ne 0) { throw 'Updater checks failed' }
+& php (Join-Path $projectRoot 'tests\refund-sync-check.php')
+if ($LASTEXITCODE -ne 0) { throw 'Refund sync checks failed' }
 $releaseRoot = Join-Path $projectRoot 'releases'
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 Add-Type -AssemblyName System.IO.Compression.FileSystem

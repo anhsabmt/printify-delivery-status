@@ -1,4 +1,6 @@
-# Printify Delivery Status 1.0.3
+# Printify Delivery Status 1.0.4
+
+1.0.4 fixes synchronization stopping on WooCommerce refund records: queries explicitly select `shop_order`, and only actual order objects can be indexed or manually linked. Refunded parent orders remain eligible; separate refund records are skipped. Existing links to invalid/deleted records require review.
 
 Default source tab: `printify_trackorder_sync`. On upgrade, the previous default `printify_multi_orders` is migrated once; other custom tab names are preserved.
 

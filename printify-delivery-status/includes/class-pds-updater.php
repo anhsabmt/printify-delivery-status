@@ -3,7 +3,7 @@ if (!defined('ABSPATH')) { exit; }
 
 /** Public GitHub releases; no hosting token or customer information is sent. */
 final class PDS_Updater {
-    const VERSION = '1.0.3';
+    const VERSION = '1.0.4';
     const SLUG = 'printify-delivery-status';
     const REPO = 'anhsabmt/printify-delivery-status';
     const CACHE = 'pds_github_release';
