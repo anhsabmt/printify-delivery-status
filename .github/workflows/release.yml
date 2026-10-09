@@ -1,0 +1,44 @@
+name: Plugin release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag (example v1.0.3)'
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Validate and package plugin
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          php -r '$v=getenv("RELEASE_VERSION"); $p=file_get_contents("printify-delivery-status/printify-delivery-status.php"); if (!preg_match("/Version: " . preg_quote($v, "/") . "\\s/", $p)) { exit(1); }'
+          php -r 'define("ABSPATH", __DIR__); require "printify-delivery-status/includes/class-pds-updater.php"; if (PDS_Updater::VERSION !== getenv("RELEASE_VERSION")) { exit(1); }'
+          php -l printify-delivery-status/printify-delivery-status.php
+          php -l printify-delivery-status/includes/class-pds-updater.php
+          php tests/plugin-check.php
+          php tests/updater-check.php
+          zip -X printify-delivery-status.zip printify-delivery-status/printify-delivery-status.php printify-delivery-status/includes/class-pds-updater.php printify-delivery-status/README.md
+          sha256sum printify-delivery-status.zip > SHA256SUMS.txt
+      - name: Publish reviewed ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "Printify Delivery Status ${RELEASE_TAG#v}" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" printify-delivery-status.zip SHA256SUMS.txt --clobber
