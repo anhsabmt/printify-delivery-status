@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Printify Delivery Status
  * Description: Read private Google Sheets and display Printify delivery status in WooCommerce.
- * Version: 1.0.7
+ * Version: 1.0.8
  * Plugin URI: https://github.com/anhsabmt/printify-delivery-status
  * Update URI: https://github.com/anhsabmt/printify-delivery-status
  * Requires at least: 5.8
@@ -92,6 +92,10 @@ final class PDS_Plugin {
     public static function stop() {
         wp_clear_scheduled_hook(self::HOOK);
         if (function_exists('as_unschedule_all_actions')) { as_unschedule_all_actions(self::HOOK, array(), 'pds'); }
+    }
+    public static function next_sync() {
+        if (function_exists('as_next_scheduled_action')) { return as_next_scheduled_action(self::HOOK, array(), 'pds'); }
+        return wp_next_scheduled(self::HOOK);
     }
     private static function guard() {
         if (!current_user_can('manage_woocommerce')) { wp_die('Access denied'); }
@@ -184,12 +188,21 @@ final class PDS_Plugin {
                 if (!in_array($h, $headers, true)) { throw new Exception('Missing required header: ' . $h); }
             }
             // Build one index per sync; never query Google while rendering Orders.
+            $links = get_option('pds_links', array()); $delivered = array(); $skipped_delivered = 0;
             $index = array(); $addresses = array(); $page = 1;
             do {
                 $orders = wc_get_orders(array('type' => 'shop_order', 'return' => 'objects', 'limit' => 100, 'page' => $page++, 'paginate' => true, 'orderby' => 'ID', 'order' => 'ASC'));
                 foreach ($orders->orders as $o) {
                     // Refunds have no shipping getters; also guard results changed by other plugins.
                     if (!self::is_delivery_order($o)) { continue; }
+                    $stored = $o->get_meta('_pds_shipments');
+                    if (is_array($stored)) {
+                        foreach ($stored as $id => $item) {
+                            if (is_array($item) && ($item['status'] ?? '') === 'shipment_delivered' && isset($links[$id]) && (int) $links[$id] === $o->get_id()) {
+                                $delivered[$id] = $item;
+                            }
+                        }
+                    }
                     $name = trim($o->get_shipping_first_name() . ' ' . $o->get_shipping_last_name());
                     $phone = method_exists($o, 'get_shipping_phone') ? $o->get_shipping_phone() : '';
                     if (!$phone) { $phone = $o->get_billing_phone(); }
@@ -198,7 +211,7 @@ final class PDS_Plugin {
                     $addresses[$o->get_id()] = array('Address 1' => $o->get_shipping_address_1(), 'Address 2' => $o->get_shipping_address_2(), 'Postcode' => $o->get_shipping_postcode(), 'Country Code' => $o->get_shipping_country());
                 }
             } while ($page <= (int) $orders->max_num_pages);
-            $links = get_option('pds_links', array()); $sources = array(); $group = array(); $reviews = array(); $canceled = array();
+            $sources = array(); $group = array(); $reviews = array(); $canceled = array();
             $manual = get_option('pds_manual_links', array());
             foreach ($d['values'] as $row) {
                 $v = array(); foreach ($headers as $i => $h) { $v[$h] = isset($row[$i]) ? (string) $row[$i] : ''; }
@@ -209,6 +222,11 @@ final class PDS_Plugin {
                     $canceled[$id] = true; continue;
                 }
                 if (isset($sources[$id])) { throw new Exception('Duplicate source Order ID. Previous data was preserved.'); }
+                // Keep delivered tracking unchanged; cancellation above still takes precedence.
+                if (isset($delivered[$id])) {
+                    $sources[$id] = $delivered[$id] + array('id' => $id, 'printify_id' => $v['Order ID'], 'candidates' => array());
+                    $skipped_delivered++; continue;
+                }
                 $key = self::key($v['Customer'], $v['Phone'], $v['Country Code']);
                 $matches = $key ? ($index[$key] ?? array()) : array();
                 $matches = array_values(array_filter($matches, function ($oid) use ($v, $addresses) { return self::address_matches($v, $addresses[$oid]); }));
@@ -262,7 +280,7 @@ final class PDS_Plugin {
                 update_option('pds_manual_links', array_diff_key(get_option('pds_manual_links', array()), $canceled), false);
             }
             update_option('pds_sources', $sources, false); update_option('pds_reviews', $reviews, false);
-            $result = array('time' => time(), 'status' => 'success', 'error' => '', 'rows' => count($sources), 'review' => count($reviews));
+            $result = array('time' => time(), 'status' => 'success', 'error' => '', 'rows' => count($sources), 'review' => count($reviews), 'skipped_delivered' => $skipped_delivered);
             update_option('pds_result', $result, false); return $result;
         } catch (Throwable $e) {
             $result = array('time' => time(), 'status' => 'error', 'error' => $e->getMessage());
@@ -337,7 +355,13 @@ final class PDS_Plugin {
         } elseif (isset($_GET['sync']) && $r) {
             echo '<div class="notice notice-' . (!empty($r['error']) ? 'error' : 'success') . '"><p>' . esc_html($r['error'] ?: 'Sync complete. Delivery statuses are updated.') . '</p></div>';
         }
-        if ($r) { echo '<p>Last completed attempt: ' . esc_html(wp_date('Y-m-d H:i:s', $r['time'])) . ' — ' . esc_html($r['error'] ?: ('Success; rows: ' . $r['rows'] . '; needs review: ' . $r['review'])) . '</p>'; }
+        if ($r) { echo '<p>Last completed attempt: ' . esc_html(wp_date('Y-m-d H:i:s', $r['time'])) . ' — ' . esc_html($r['error'] ?: ('Success; rows: ' . $r['rows'] . '; needs review: ' . $r['review'] . '; delivered skipped: ' . ($r['skipped_delivered'] ?? 0))) . '</p>'; }
+        $next = self::next_sync();
+        if ($next === true) { echo '<p>Automatic sync: a background task is running or waiting to start.</p>'; }
+        elseif ($next) {
+            echo '<p>Next automatic sync: ' . esc_html(wp_date('Y-m-d H:i:s T', $next)) . '</p>';
+            if ($next < time() - 300) { echo '<div class="notice notice-warning"><p>The automatic sync is overdue. Check cron and background requests on your hosting server.</p></div>'; }
+        } else { echo '<div class="notice notice-warning"><p>No automatic sync is scheduled. Check that WooCommerce and its scheduler are running.</p></div>'; }
         echo '<p>Saving settings also syncs immediately. The buttons wait for sync to finish and then show the result.</p>';
         echo '<form method="post" onsubmit="this.querySelector(\'input[type=submit]\').disabled=true;this.querySelector(\'input[type=submit]\').value=\'Saving and syncing…\';" action="' . esc_url(admin_url('admin-post.php')) . '"><input type="hidden" name="action" value="pds_settings">'; wp_nonce_field('pds_settings');
         foreach (array('path' => 'Service account JSON path on this server', 'sheet' => 'Spreadsheet ID', 'tab' => 'Sheet tab') as $key => $label) {

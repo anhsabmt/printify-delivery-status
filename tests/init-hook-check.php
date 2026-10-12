@@ -23,6 +23,9 @@ function wp_schedule_event($time, $recurrence, $hook) {
 if ($backend === 'action-scheduler') {
     function as_has_scheduled_action($hook, $args, $group) { return isset($GLOBALS['scheduled'][$hook]); }
     function as_get_scheduled_actions($args, $format) { return isset($GLOBALS['scheduled'][$args['hook']]) ? array(1) : array(); }
+    function as_next_scheduled_action($hook, $args, $group) {
+        return !empty($GLOBALS['running']) ? true : ($GLOBALS['scheduled'][$hook]['time'] ?? false);
+    }
     function as_schedule_recurring_action($time, $interval, $hook, $args, $group) {
         $GLOBALS['scheduled'][$hook] = array('time' => $time, 'interval' => $interval, 'group' => $group);
     }
@@ -44,15 +47,21 @@ $before = time();
 wordpress_init();
 verify_init(isset($scheduled[PDS_Plugin::HOOK]), 'init schedules without int plus string fatal');
 $job = $scheduled[PDS_Plugin::HOOK];
+verify_init(PDS_Plugin::next_sync() === $job['time'], 'next-sync display uses scheduler timestamp');
 verify_init($job['time'] >= $before + 60 && $job['time'] <= time() + 60, 'init uses default delay of 60 seconds');
 $registration = array_filter($hooks['init'][10], function ($item) { return $item['callback'] === array('PDS_Plugin', 'schedule'); });
 verify_init(count($registration) === 1 && reset($registration)['accepted_args'] === 0, 'scheduler receives no init arguments');
 wordpress_init();
 verify_init($scheduled[PDS_Plugin::HOOK] === $job, 'repeat init preserves existing schedule');
-$scheduled = array(); PDS_Plugin::schedule(HOUR_IN_SECONDS);
+$scheduled = array();
+verify_init(PDS_Plugin::next_sync() === false, 'missing schedule is reported');
+PDS_Plugin::schedule(HOUR_IN_SECONDS);
 verify_init($scheduled[PDS_Plugin::HOOK]['time'] >= time() + 3599, 'explicit manual reschedule still uses one-hour delay');
+verify_init(PDS_Plugin::next_sync() === $scheduled[PDS_Plugin::HOOK]['time'], 'next-sync display reflects manual reschedule');
 if ($backend === 'action-scheduler') {
     verify_init($scheduled[PDS_Plugin::HOOK]['group'] === 'pds' && $scheduled[PDS_Plugin::HOOK]['interval'] === 3600, 'Action Scheduler hourly group preserved');
+    $running = true;
+    verify_init(PDS_Plugin::next_sync() === true, 'running or async action reported without inventing a timestamp');
 } else {
     verify_init($scheduled[PDS_Plugin::HOOK]['recurrence'] === 'hourly', 'WP-Cron hourly fallback preserved');
 }

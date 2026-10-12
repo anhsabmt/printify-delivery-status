@@ -1,6 +1,6 @@
-# Printify Delivery Status 1.0.7
+# Printify Delivery Status 1.0.8
 
-1.0.7 excludes canceled source orders before matching and removes their previously saved shipment data and links after a successful sync. Active replacements remain eligible, whether shipped or in production. The PHP 8 initialization fix from 1.0.6 is retained: the scheduler callback accepts zero init hook arguments and uses its numeric default delay. Regression checks cover both Action Scheduler and WP-Cron.
+1.0.8 stops matching and updating tracking already saved as `shipment_delivered`, retaining the Delivered badge and original tracking link. Active sibling shipments continue to update. Settings show the next automatic sync time, overdue/missing schedule notices, and the delivered-skipped count. Cancellation cleanup and the PHP 8 initialization fix are retained.
 
 Immediate Save/Sync, automatic grouping of multiple source shipments matching one WooCommerce order, and clickable status-only badges from 1.0.5 are retained. Clicking a badge opens that shipment's TrackOrder URL in a new tab. The refund-record fix from 1.0.4 is retained: only actual shop orders are indexed and linked; refunded parent orders remain eligible.
 
@@ -15,6 +15,9 @@ Default source tab: `printify_trackorder_sync`. On upgrade, the previous default
 
 ## Behavior
 - Hourly background sync using Action Scheduler, with WP-Cron fallback.
+- Settings show the next automatic sync in the WordPress site's timezone, or a running/waiting indication for asynchronous jobs. Jobs more than five minutes past their due time show an overdue notice. This displays scheduler state; it does not diagnose the cause of a delayed job or replace hosting cron.
+- A previously saved `shipment_delivered` shipment with a valid link is kept unchanged and skipped before name/address matching. Its number, carrier, URL, status and checked time are preserved. An order whose sources are all skipped receives no metadata writes. New delivered sources can be imported once; active siblings and new active sources can still match the same WooCommerce order.
+- Cancellation takes precedence over delivered preservation. The Google Sheet is still read as one snapshot to discover new sources and canceled rows; the delivered rule skips per-source matching and order updates, rather than suppressing the shared Sheet read.
 - Save and Sync now cancel this plugin's pending sync jobs, restore the next hourly run, and sync directly. Other plugins' jobs and active sync locks are preserved.
 - If a sync is already active, the newest refresh request is retained. The settings page refreshes automatically and runs it as soon as the lock is released; no manual task cleanup is needed. Other authorized admin GET requests also resume it. Locks older than 15 minutes are recovered.
 - After a plugin version update, configured installations refresh on the next admin GET request by a user who can manage WooCommerce. Saved settings are used without clicking Sync now again.

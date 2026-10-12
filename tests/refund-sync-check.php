@@ -233,7 +233,8 @@ namespace {
             }
             return array('code' => 200, 'body' => json_encode(array('values' => $values)));
         };
-        unset($sheet_response); PDS_Plugin::sync();
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-1', 'TrackOrder Latest Status' => 'shipment_in_transit'), array('Order ID' => 'test-2', 'TrackOrder Latest Status' => 'shipment_in_transit')));
+        PDS_Plugin::sync();
         $options['pds_manual_links'] = array('test-shop:test-1' => true, 'test-shop:test-2' => true);
         $sheet_response = $sheetFixture(array(
             array('Order ID' => 'test-1', 'Status' => ' canceled ', 'TrackOrder Latest Status' => 'in-production', 'Tracking Number' => 'CANCELED-NUMBER'),
@@ -288,6 +289,46 @@ namespace {
         verify_sync(PDS_Plugin::sync()['status'] === 'success' && !$options['pds_links'], 'canceled old refund link removed without refund getters');
         unset($sheet_response); PDS_Plugin::sync();
         verify_sync(isset($parent->meta['_pds_shipments']['test-shop:test-1'], $parent->meta['_pds_shipments']['test-shop:test-2']), 'active sources can be matched again after cancellation is removed');
-        echo "$checks refund, split shipment, immediate sync, badge and cancellation checks passed\n";
+        // Delivered tracking is immutable after its first successful import.
+        $parent = new \Automattic\WooCommerce\Admin\Overrides\Order();
+        $options['pds_links'] = array(); $options['pds_manual_links'] = array();
+        $sheet_response = $sheetFixture(array(
+            array('Order ID' => 'test-1', 'TrackOrder Latest Status' => 'shipment_delivered', 'Tracking Number' => 'DONE-ORIGINAL', 'TrackOrder URL' => 'https://trackorder.site/done-original'),
+            array('Order ID' => 'test-2', 'TrackOrder Latest Status' => 'shipment_in_transit', 'Tracking Number' => 'ACTIVE-ORIGINAL'),
+        ));
+        $result = PDS_Plugin::sync();
+        verify_sync($result['status'] === 'success' && $result['skipped_delivered'] === 0, 'new delivered source imported once');
+        $done = $parent->meta['_pds_shipments']['test-shop:test-1']; $saved = $parent->saved;
+        $sheet_response = $sheetFixture(array(
+            array('Order ID' => 'test-1', 'Phone' => '9999999999', 'Address 1' => 'Different address', 'TrackOrder Latest Status' => 'in-production', 'Tracking Number' => 'DONE-CHANGED', 'TrackOrder URL' => 'https://trackorder.site/done-changed'),
+            array('Order ID' => 'test-2', 'TrackOrder Latest Status' => 'shipment_in_transit', 'Tracking Number' => 'ACTIVE-CHANGED'),
+        ));
+        $result = PDS_Plugin::sync();
+        verify_sync($result['skipped_delivered'] === 1 && $result['review'] === 0, 'delivered source skipped without rematching changed recipient');
+        verify_sync($parent->meta['_pds_shipments']['test-shop:test-1'] === $done, 'delivered status, number, URL and checked time stay unchanged');
+        verify_sync($options['pds_sources']['test-shop:test-1'] === $done && $options['pds_links']['test-shop:test-1'] === 5, 'delivered source and association retained');
+        verify_sync($parent->meta['_pds_shipments']['test-shop:test-2']['number'] === 'ACTIVE-CHANGED' && $parent->saved === $saved + 1, 'active sibling continues to update');
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-1', 'TrackOrder Latest Status' => 'fulfilled', 'Tracking Number' => 'IGNORED')));
+        $saved = $parent->saved; $meta = $parent->meta;
+        $result = PDS_Plugin::sync();
+        verify_sync($result['skipped_delivered'] === 1 && $parent->saved === $saved && $parent->meta === $meta, 'all-delivered snapshot does not write order or sync timestamp');
+        ob_start(); PDS_Plugin::column('pds_delivery', $parent); $html = ob_get_clean();
+        verify_sync(strpos($html, 'Delivered') !== false && strpos($html, 'done-original') !== false && strpos($html, 'done-changed') === false, 'original delivered badge and clickable URL remain');
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-1', 'Status' => 'canceled', 'TrackOrder Latest Status' => 'shipment_delivered')));
+        PDS_Plugin::sync();
+        verify_sync(!isset($parent->meta['_pds_shipments']['test-shop:test-1']) && !isset($options['pds_links']['test-shop:test-1']), 'cancellation still removes a previously delivered source');
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-3', 'TrackOrder Latest Status' => 'shipment_delivered')));
+        PDS_Plugin::sync();
+        verify_sync(isset($parent->meta['_pds_shipments']['test-shop:test-3']) && $options['pds_links']['test-shop:test-3'] === 5, 'new delivered shipment remains eligible after cleanup');
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-3'), array('Order ID' => 'test-4', 'Tracking Number' => 'NEW-ACTIVE')));
+        PDS_Plugin::sync();
+        verify_sync($parent->meta['_pds_shipments']['test-shop:test-3']['status'] === 'shipment_delivered' && $parent->meta['_pds_shipments']['test-shop:test-4']['number'] === 'NEW-ACTIVE', 'new active sibling can match an order with delivered tracking');
+        $meta = $parent->meta; $saved = $parent->saved;
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-3'), array('Order ID' => 'test-3')));
+        verify_sync(PDS_Plugin::sync()['status'] === 'error' && $parent->meta === $meta && $parent->saved === $saved, 'duplicate delivered rows remain a validation error with no writes');
+        $options['pds_links']['test-shop:test-3'] = 99;
+        $sheet_response = $sheetFixture(array(array('Order ID' => 'test-3')));
+        verify_sync(PDS_Plugin::sync()['review'] === 1, 'invalid link is not rescued by delivered cache from another order');
+        echo "$checks refund, split shipment, immediate sync, badge, cancellation and delivered checks passed\n";
     } finally { if (is_file($temp)) { unlink($temp); } }
 }
